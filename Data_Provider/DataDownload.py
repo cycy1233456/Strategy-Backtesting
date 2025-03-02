@@ -132,4 +132,6 @@ class StockDataProcessor:
 
         return stock_data
 stock_processor = StockDataProcessor(api_key="75yK0LRV7d5rFsSUOg0dvChWr5mJzT4x")
-data = stock_processor.fetch_stock_data('SPY', '2019-01-01', '2024-11-11', interval='second', multiplier=1)
+
+if __name__ == '__main__':
+    data = stock_processor.fetch_stock_data('SPY', '2019-01-01', '2024-11-11', interval='minute', multiplier=1)

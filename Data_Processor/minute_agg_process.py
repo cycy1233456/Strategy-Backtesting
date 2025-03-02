@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 file_path = 'E:/minute_aggs_v1/2024/11/2024-11-14.csv' #
-# data = pd.read_csv(file_path)
+data = pd.read_csv(file_path)
 
 # Define UTC and US/Eastern time zones
 utc = pytz.utc
