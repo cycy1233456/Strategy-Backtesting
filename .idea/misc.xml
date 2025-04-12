@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="option_strategy" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="option_strategy" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="machine_learning" project-jdk-type="Python SDK" />
 </project>

@@ -1,23 +1,11 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from pandas.tseries.holiday import USFederalHolidayCalendar
 from datetime import datetime
 
-from data_utils import data_dirs, _get_timestamp_
-
-def read_index_file(file_path:str, index, nrows=None):
-    file_path = Path(file_path).joinpath(index+'.csv')
-    if not file_path.exists():
-        return pd.DataFrame()
-    use_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume' ,'VWAP', 'Transaction']
-    if not nrows:
-        data = pd.read_csv(file_path, nrows=nrows, usecols=use_cols)
-    else:
-        data = pd.read_csv(file_path, usecols=use_cols)
-    data.columns = ['date', 'open', 'high', 'low', 'close', 'volume' ,'VWAP', 'transaction']
-    return data
-# data = read_index_file(data_dirs['ETFS_second'], 'SPY', nrows=10)
+from Backtest_utils.data_utils import (data_dirs, _get_timestamp_, _calculate_vwap_, _calculate_twap_,
+                                _calculate_skew_, _calculate_var_, _calculate_kurtosis_, _calculate_down_std_share_,
+                                _calculate_flow_in_ratio_, remove_weekends_and_holidays)
 
 def read_index_file(file_path: str, index, start_date, end_date):
     file_path = Path(file_path).joinpath(index + '.csv')
@@ -44,43 +32,6 @@ def read_index_file(file_path: str, index, start_date, end_date):
     data.columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'VWAP', 'transaction']
     return data
 
-def _calculate_twap_(group):
-    return (group['close']).mean()
-def _calculate_vwap_(group):
-    if 'VWAP' in group.columns:
-        return (group['VWAP'] * group['volume']).sum() / group['volume'].sum()
-    else:
-        return ((group['close']+group['open'])/2 * group['volume']).sum() / group['volume'].sum()
-
-
-def determine_index_frequency(df):
-    """
-    确定 DataFrame 索引的时间频率。
-
-    :param df: 包含 DatetimeIndex 的 DataFrame
-    :return: 频率字符串，如 'S'（秒）、'T'（分钟）、'H'（小时）
-    """
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("DataFrame 的索引必须是 DatetimeIndex")
-
-    # 计算索引之间的时间差
-    time_diffs = df.index.to_series().diff()
-
-    # 统计时间差的唯一值及其出现次数
-    diff_counts = time_diffs.value_counts()
-
-    # 获取最常见的非空时间差
-    most_common_diff = diff_counts.index[0]
-
-    # 判断频率
-    if most_common_diff == pd.Timedelta(seconds=1):
-        return 'S'  # 秒频率
-    elif most_common_diff == pd.Timedelta(minutes=1):
-        return 'T'  # 分钟频率
-    elif most_common_diff == pd.Timedelta(hours=1):
-        return 'H'  # 小时频率
-    else:
-        return None  # 无法确定频率
 
 def _padding_data_(df_filtered):
     # 填充缺失数据
@@ -92,23 +43,21 @@ def _padding_data_(df_filtered):
     df_filtered['volume'] = df_filtered['volume'].fillna(0)  # 填充交易量为0
     df_filtered['transaction'] = df_filtered['transaction'].fillna(0)
     df_filtered['VWAP'] = df_filtered['VWAP'].fillna(df_filtered['close'].shift())
-    df_filtered['TWAP'] = df_filtered['TWAP'].fillna(df_filtered['close'].shift())
+    # df_filtered['TWAP'] = df_filtered['TWAP'].fillna(df_filtered['close'].shift())
     return df_filtered
 
-def remove_weekends_and_holidays(df):
-    """
-    去掉周末和节假日的数据
-    :param df: 包含 DatetimeIndex 的 DataFrame
-    :return: 过滤后的 DataFrame
-    """
-    us_cal = USFederalHolidayCalendar()
-    holidays = us_cal.holidays(start=df.index.min(), end=df.index.max())
-    df = df[~df.index.normalize().isin(holidays)]
-    df = df[df.index.weekday < 5]  # 去掉周末
-    return df
+def calculate_factors(df, resample_freq, **kwargs):
+    # kwargs = {
+    #     'VWAP': _calculate_vwap_,
+    #     'TWAP': _calculate_twap_,
+    # }
+    factor_value = {}
+    for factor_name, method in kwargs.items():
+        factor_value[factor_name] = df.resample(resample_freq).apply(method)
+    return pd.DataFrame(factor_value)
 
 def get_time_period_resampled_data(df, resample_freq='5min', start_time="09:30", end_time="16:01"
-                                   , time_adjust=True, padding=True, discrete_return=True):
+                                   , time_adjust=True, padding=True, discrete_return=True, extra_factors=True):
     """
     更改数据的频率 可选 X * 秒 分钟 天
     :param df:
@@ -120,6 +69,7 @@ def get_time_period_resampled_data(df, resample_freq='5min', start_time="09:30",
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("DataFrame 的索引必须是 DatetimeIndex")
 
+    df['return'] = df['close'].pct_change()
     # 进行数据频率修改
     resampled_df = df.resample(resample_freq).agg({
         'volume': 'sum',
@@ -129,8 +79,26 @@ def get_time_period_resampled_data(df, resample_freq='5min', start_time="09:30",
         'close': 'last',
         'transaction': 'sum',
     })
-    resampled_df['VWAP'] = df.resample(resample_freq).apply(_calculate_vwap_)
-    resampled_df['TWAP'] = df.resample(resample_freq).apply(_calculate_vwap_)
+    if extra_factors:
+        factor_values = calculate_factors(
+            df,
+            resample_freq='5min',
+            VWAP = _calculate_vwap_,
+            TWAP = _calculate_twap_,
+            skew=_calculate_skew_,
+            kurtosis=_calculate_kurtosis_,
+            down_std_share=_calculate_down_std_share_,
+            flow_in_ratio=_calculate_flow_in_ratio_,
+            variance=_calculate_var_
+        )
+    else:
+        factor_values = calculate_factors(
+            df,
+            resample_freq='5min',
+            VWAP=_calculate_vwap_,
+            TWAP=_calculate_twap_)
+
+    resampled_df = pd.concat([resampled_df, factor_values], axis=1)
 
     # 选取需要的时间段
     resampled_df = resampled_df.between_time(start_time, end_time)
@@ -185,7 +153,7 @@ def get_different_time_period_data(time_period='morning'):
 
 class IndexData:
     def __init__(self, root_path, resample_freq='5min', need_time_period='morning', X_window=10, Y_window=5
-                 ,start_date='2020-01-01', end_date='2020-02-01', time_adjust=True, padding=True):
+                 ,start_date='2020-01-01', end_date='2020-02-01', time_adjust=True, padding=True, extra_factors=True):
         """
         数据处理集
         :param root_path: 指数csv路径
@@ -204,19 +172,21 @@ class IndexData:
         self.resample_freq = resample_freq
         self.time_adjust = time_adjust
         self.padding = padding
+        self.extra_factors = extra_factors
+        self.raw_data = pd.DataFrame()
         self.index_data = pd.DataFrame()
         self.data_samples = None
         self.X_window, self.Y_window = X_window, Y_window
         self.X_train, self.Y_train = None, None
 
     def load_index_data(self, index):
-        data = read_index_file(data_dirs['ETFS_second'], index=index,start_date=self.start_date, end_date=self.end_date)
-        data = _get_timestamp_(data, time_column='date', time_format='second', set_time_as_index=False)
-        self.index_data = get_time_period_resampled_data(data, resample_freq=self.resample_freq
-                                                                 , time_adjust=self.time_adjust, padding=self.padding)
+        self.raw_data = read_index_file(self.root_path, index=index,start_date=self.start_date, end_date=self.end_date)
+        self.index_data = _get_timestamp_(self.raw_data, time_column='date', time_format='second', set_time_as_index=False)
+        self.index_data = get_time_period_resampled_data(self.index_data, resample_freq=self.resample_freq
+                                , time_adjust=self.time_adjust, padding=self.padding, extra_factors=self.extra_factors)
 
     def create_samples(self, df, label='return'):
-        X_window = self.X_window  # 过去 10 条数据作为输入
+        X_window = self.X_window  # 过去 X 条数据作为输入
         Y_window = self.Y_window
         X_samples, Y_samples = [], []
 
@@ -239,12 +209,12 @@ class IndexData:
                 X_daily, Y_daily = self.create_samples(daily_df, label=label)
                 X_all.append(X_daily)
                 Y_all.append(Y_daily)
+            X_train = np.vstack(X_all)
+            Y_train = np.vstack(Y_all)
+            self.X_train, self.Y_train = X_train, Y_train
         else:
-            X_all, Y_all = self.create_samples(self.index_data)
-
-        X_train = np.vstack(X_all)
-        Y_train = np.vstack(Y_all)
-        self.X_train, self.Y_train = X_train, Y_train
+            X_train, Y_train = self.create_samples(self.index_data)
+            self.X_train, self.Y_train = X_train, Y_train
 
         return X_train, Y_train
 
@@ -267,14 +237,21 @@ class IndexData:
 
 
 if __name__ == '__main__':
-    data = read_index_file(data_dirs['ETFS_second'], index='QQQ',start_date='2020-01-01', end_date='2020-02-01')
-    data = _get_timestamp_(data, time_column='date', time_format='second', set_time_as_index=False)
-    data = get_time_period_resampled_data(data, resample_freq='30S', time_adjust=True, padding=True)
+    # data = read_index_file(data_dirs['ETFS_second'], index='QQQ',start_date='2020-01-01', end_date='2020-02-01')
+    # data = _get_timestamp_(data, time_column='date', time_format='second', set_time_as_index=False)
+    # data = get_time_period_resampled_data(data, resample_freq='30S', time_adjust=True, padding=True)
 
     """ 示例用法 """
 
     Index_data = IndexData(root_path=data_dirs['ETFS_second'], resample_freq='5min', need_time_period='morning', X_window=10, Y_window=5
-                           , time_adjust=True, padding=True)
+                           , time_adjust=True, padding=True, start_date='2020-01-01', end_date='2020-01-10')
+    SP_stock_data = IndexData(root_path=data_dirs['Stocks_second'], resample_freq='5min', need_time_period='morning', X_window=10, Y_window=5
+                           , time_adjust=True, padding=True, start_date='2020-01-01', end_date='2024-01-10')
+    # STOCK DATA SAMPLE ONLY FOR SP500 SECOND
+    STOCK_DATA = SP_stock_data
+    STOCK_DATA.load_index_data(index='AAPL')
+    # index data sample
     self = Index_data
     self.load_index_data(index='QQQ')
+    self.resample_freq = '1S'
     self.load_data_sample()

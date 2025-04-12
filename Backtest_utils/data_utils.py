@@ -2,11 +2,8 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-
-
-
-# from Data_Processor.minute_agg_process import file_path
-from tickers_lists import SP500_tickers
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from Backtest_utils.tickers_lists import SP500_tickers
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -28,7 +25,8 @@ padding: 是否将所有的分钟条数补全
 # file_path = 'E:/minute_aggs_v1/2024/11/2024-11-14.csv'  #
 # data = pd.read_csv(file_path)
 
-data_dirs = {'minute': "E:/minute_aggs_v1", 'day': "E:/day_aggs_v1", 'SP500':'E:/SP500_minute', 'ETFS_second':'E:/Second/Indices/2020-2024'}
+data_dirs = {'minute': "E:/minute_aggs_v1", 'day': "E:/day_aggs_v1", 'SP500':'E:/SP500_minute', 'ETFS_second':'E:/Second/Indices/2020-2024'
+             , 'Stocks_second':'E:/Second/SP500/2020-2024'}
 
 
 
@@ -136,18 +134,27 @@ def _get_timestamp_(df, time_column='window_start', time_format='minute', set_ti
     :return:
     """
     df = df.copy()
-    if len(str(df.loc[0, time_column])) == 19:
-        time_period = 'ns'
-    elif len(str(df.loc[0, time_column])) == 13:
-        time_period = 'ms'
-        # 从纳秒转换为 UTC 时间
+    if isinstance(df.loc[0, time_column], pd.Timestamp):
+        # 无需处理
+        df.rename({time_column: 'Datetime'}, inplace=True)
+    else:
+        # 时间戳转换
+        if len(str(df.loc[0, time_column])) == 19:
+            # 从纳秒转换为 UTC 时间
+            time_period = 'ns'
+        elif len(str(df.loc[0, time_column])) == 13:
+            time_period = 'ms'
+        elif len(str(df.loc[0, time_column])) == 10:
+            time_period = 's'
+
         df['Datetime'] = (
             pd.to_datetime(df[time_column], unit=time_period)
             .dt.tz_localize('UTC')  # 明确时间为 UTC
             .dt.tz_convert('America/New_York')
             .dt.tz_localize(None)
         )
-    if time_column != 'Datetime':
+    # 留下 Datetime 作为唯一的时间列
+    if time_column != 'Datetime' and time_column in df.columns.to_list():
         df.drop(columns=[time_column], inplace=True)
 
     # 输出的时间列为 datetime 时间调整**
@@ -160,9 +167,120 @@ def _get_timestamp_(df, time_column='window_start', time_format='minute', set_ti
 
     if set_time_as_index:
         df.set_index('Datetime')
+
+    return df
+
+def remove_weekends_and_holidays(df, time_column='index'):
+    """
+    去掉周末和节假日的数据
+    :param df: 包含 DatetimeIndex 的 DataFrame
+    :return: 过滤后的 DataFrame
+    """
+    us_cal = USFederalHolidayCalendar()
+    if time_column == 'index':
+        # 从时间索引中进行查找
+        holidays = us_cal.holidays(start=df.index.min(), end=df.index.max())
+        df = df[~df.index.normalize().isin(holidays)]
+        df = df[df.index.weekday < 5]  # 去掉周末
+    else:
+        holidays = us_cal.holidays(start=df[time_column].min(), end=df[time_column].max())
+        df = df[~df[time_column].normalize().isin(holidays)]
+        df = df[df[time_column].weekday < 5]  # 去掉周末
     return df
 
 
+""" 高频因子构建 """
+def _calculate_twap_(group):
+    return (group['close']).mean()
+
+def _calculate_vwap_(group):
+    if 'VWAP' in group.columns:
+        return (group['VWAP'] * group['volume']).sum() / group['volume'].sum()
+    else:
+        return ((group['close']+group['open'])/2 * group['volume']).sum() / group['volume'].sum()
+
+def _calculate_skew_(group):
+    """
+    计算给定分组的skew值
+    :param group:
+    :return:
+    """
+    return group['return'].skew()
+
+def _calculate_kurtosis_(group):
+    """
+    计算给定分组的kurtosis值
+    :param group:
+    :return:
+    """
+    return group['return'].kurtosis()
+
+def _calculate_var_(group):
+    """
+    计算给定分组的variance值
+    :param group:
+    :return:
+    """
+    return group['return'].std()
+
+def _calculate_down_std_share_(group):
+    """
+    计算给定分组的variance值
+    :param group:
+    :return:
+    """
+    SR = np.square(group['return'])
+    return (SR * (group['return']>0)).sum() / SR.sum()
+
+def _calculate_flow_in_ratio_(group):
+    """
+    计算流动比率 (FlowInRatio)
+
+    :param df: 包含 volume 和 close 列的 DataFrame
+    :param volume_col: 交易量列名
+    :param close_col: 收盘价列名
+    :return: 流动比率
+    """
+    close_diff = group['close'].diff().fillna(0)
+    numerator = (group['volume'] * group['close'] * np.sign(close_diff)).sum()
+    amount_total = (group['VWAP'] * group['volume']).sum()
+    flow_in_ratio = numerator / amount_total
+    return flow_in_ratio
+
+
+
+
+def determine_index_frequency(df):
+    """
+    确定 DataFrame 索引的时间频率。
+
+    :param df: 包含 DatetimeIndex 的 DataFrame
+    :return: 频率字符串，如 'S'（秒）、'T'（分钟）、'H'（小时）
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame 的索引必须是 DatetimeIndex")
+
+    # 计算索引之间的时间差
+    time_diffs = df.index.to_series().diff()
+
+    # 统计时间差的唯一值及其出现次数
+    diff_counts = time_diffs.value_counts()
+
+    # 获取最常见的非空时间差
+    most_common_diff = diff_counts.index[0]
+
+    # 判断频率
+    if most_common_diff == pd.Timedelta(seconds=1):
+        return 'S'  # 秒频率
+    elif most_common_diff == pd.Timedelta(minutes=1):
+        return 'T'  # 分钟频率
+    elif most_common_diff == pd.Timedelta(hours=1):
+        return 'H'  # 小时频率
+    else:
+        return None  # 无法确定频率
+
+
+"""先提取出需要时间的数据 再resample 数据量较大的情况"""
 def _get_time_period_data_(df, start_time="09:00", end_time="16:01", padding=True):
     """
     选取给定时间段的数据 并决定是否需要padding
@@ -200,7 +318,7 @@ def _get_time_period_data_(df, start_time="09:00", end_time="16:01", padding=Tru
             # 填充缺失数据
             # 填充OHLC为前一个时间点的close，交易量为0
             df_filled['close'] = df_filled['close'].ffill()  # close 仍然用前一个有效值填充
-            df_filled[['ticker', 'window_start']] = df_filled[['ticker', 'window_start']].ffill()
+            df_filled[['ticker']] = df_filled[['ticker']].ffill()
             df_filled['open'] = df_filled['open'].fillna(df_filled['close'].shift())
             df_filled['high'] = df_filled['high'].fillna(df_filled['close'].shift())
             df_filled['low'] = df_filled['low'].fillna(df_filled['close'].shift())
@@ -214,25 +332,7 @@ def _get_time_period_data_(df, start_time="09:00", end_time="16:01", padding=Tru
     return df_padded
 
 
-def _calculate_twap(group: pd.core.groupby.generic.DataFrameGroupBy, base_price='close'):
-    """
-    计算 Time-Weighted Average Price (TWAP)
-    TWAP = sum(price * duration) / sum(duration)
-    """
-    return group[base_price].mean()
-
-
-def _calculate_vwap(group):
-    """
-    计算 Volume-Weighted Average Price (VWAP)
-    """
-    volume_sum = group['volume'].sum()
-    if volume_sum == 0:
-        return np.nan  # 如果成交量为零，返回 NaN 或者 0
-    return np.sum((group['close']+group['open'])/2 * group['volume']) / volume_sum
-
-
-def _resample_data_(df, resample_freq:'str', time_adjust=True):
+def _resample_data_(df, resample_freq:'str', time_adjust=True, discrete_return=True):
     """
     目前输入的df index ：t代表 (t-1, t]的时间条
     resample过程中 会以传入的第一个时间节点 t_start 为开始 向后对 t_start + resample_freq的时间进行 aggregate
@@ -240,8 +340,8 @@ def _resample_data_(df, resample_freq:'str', time_adjust=True):
     example: resample_freq=60min time_point=16:00
             -->if adjusted: (15:00, 16:00]  --> if not adjust: (14:59, 15:59]
     :param df: index
-    :param resample_freq:
-    :return: resampled_data with ohlc TWAP VWAP
+    :param resample_freq: 时间的窗口长度 支持 分钟 X * min/ day
+    :return: resampled_data with ohlc TWAP VWAP return(discrete/continuous)
     """
     if not isinstance(df.index, pd.DatetimeIndex):
         return 'ERROR: NOT DATETIME INDEX'
@@ -257,25 +357,45 @@ def _resample_data_(df, resample_freq:'str', time_adjust=True):
         'high': 'max',
         'low': 'min',
         'close': 'last',
-        'window_start': 'first',
         'transactions': 'sum'
     })
 
     # 计算 TWAP 和 VWAP
-    twap_column = df.groupby('ticker').resample(resample_freq, origin=origin).apply(_calculate_twap)
+    twap_column = df.groupby('ticker').resample(resample_freq, origin=origin).apply(_calculate_twap_)
     # 用start为标签的情况 直接返回一个multiindex 如果用end的话需要用一个stack来变成multi index
     twap_column = twap_column if origin=='start' else twap_column.stack()
-    vwap_column = df.groupby('ticker').resample(resample_freq, origin=origin).apply(_calculate_vwap)
+    vwap_column = df.groupby('ticker').resample(resample_freq, origin=origin).apply(_calculate_vwap_)
     vwap_column = vwap_column if origin == 'start' else vwap_column.stack()
 
     resampled_df['TWAP'] = twap_column
     resampled_df['VWAP'] = vwap_column
+
+
+    if discrete_return:
+        for ticker in resampled_df['ticker'].unique():
+            mask = resampled_df['ticker'] == ticker
+            ticker_df = resampled_df.loc[mask]
+
+            ticker_df['return'] = ticker_df['close'].pct_change()
+            # 离散数据情况用的收益率每天的第一条和最后一条调整 非连续收益--不用隔夜收益率
+            adjust_rows = pd.concat([ticker_df.groupby(ticker_df.index.date).head(1)
+                                        , ticker_df.groupby(ticker_df.index.date).tail(1)]).sort_index()
+            adjust_rows['return'] = adjust_rows['close'] / adjust_rows['open'] - 1
+            resampled_df.loc[adjust_rows.index, 'return'] = adjust_rows['return']
+    else:
+        # 非离散 可以用隔夜收益率
+        resampled_df['return'] = np.nan
+        for ticker in resampled_df['ticker'].unique():
+            mask = resampled_df['ticker'] == ticker  # Create a boolean mask
+            resampled_df.loc[mask, 'return'] = resampled_df.loc[mask, 'close'].pct_change()
+
 
     # 重置索引
     resampled_df.reset_index(inplace=True)
     # 去掉 NaN 数据
     resampled_df.dropna(axis=0, inplace=True)
     resampled_df.set_index('level_1', inplace=True)
+
     return resampled_df
 
 
@@ -297,13 +417,22 @@ def load_minute_data_df(tickers:list, start_date, end_date, start_time, end_time
     minute_data = _get_timestamp_(minute_data)
     # 提取一个固定时间段的每日数据
     need_minute_data = _get_time_period_data_(df=minute_data, start_time=start_time, end_time=end_time, padding=True)
+
+
     if resample_freq is None:
+        # 去掉不需要的时间段
+        minute_data = remove_weekends_and_holidays(need_minute_data)
         return minute_data
     else:
         resampled_minute_data = _resample_data_(need_minute_data, resample_freq=resample_freq)
+        # 去掉不需要的时间段
+        resampled_minute_data = remove_weekends_and_holidays(resampled_minute_data)
+
         return resampled_minute_data
 
 
+
+""" ##################################################################################################"""
 def load_minute_data_point(tickers:list, date_point, minute_point, resample_freq: str):
     """
     单一时间点 数据条 可用与交易下单时给定时间点
@@ -558,5 +687,6 @@ if __name__ == '__main__':
     tickers = SP500_tickers # 指定的股票代码
     start_date = "2021-01-01"
     end_date = "2021-12-31"
-    data = read_index_file(data_dirs['ETFS_second'], index='QQQ', nrows=10000)
+    data = load_minute_data_df(tickers=['AAPL', 'MSFT'], start_date='2020-01-01', end_date='2020-02-01', start_time='09:30',
+                        end_time='16:00', resample_freq='5min')
     # close_df = agg_tickers_daily_data(SP500_tickers, start_date, end_date, 'close')
